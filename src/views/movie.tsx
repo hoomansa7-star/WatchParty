@@ -24,8 +24,12 @@ import {
   Sparkles,
   Bot,
   Subtitles,
+  Pause,
+  X,
 } from "lucide-react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -135,11 +139,110 @@ export function MovieView({ id }: { id: string }) {
   const [iframeError, setIframeError] = useState(false);
   const iframeRetryCount = useRef(0);
   const [subtitleTrackUrl, setSubtitleTrackUrl] = useState<string | null>(null);
+  const [activeSubTitle, setActiveSubTitle] = useState<string | null>(null);
+  const [autoSubLoading, setAutoSubLoading] = useState(false);
+  const [embedCurrentTime, setEmbedCurrentTime] = useState<number>(0);
+  const [embedIsPlaying, setEmbedIsPlaying] = useState<boolean>(true);
+  const [isLiveSynced, setIsLiveSynced] = useState<boolean>(false);
+  const [jumpMinuteInput, setJumpMinuteInput] = useState<string>("");
+  const autoSubFetchingRef = useRef<string | null>(null);
+
+  // Clock ticker when player is running without iframe live sync
   useEffect(() => {
-    if (subtitleTrackUrl) {
-      toast.success("زیرنویس نمایش داده شد! در صورت عدم هماهنگی از دکمه «هماهنگی زیرنویس» روی پلیر استفاده کنید.");
+    if (activeModal !== "stream" || !embedIsPlaying || isLiveSynced) return;
+    const interval = setInterval(() => {
+      setEmbedCurrentTime((t) => t + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [activeModal, embedIsPlaying, isLiveSynced]);
+
+  const formatPlayerTime = (seconds: number): string => {
+    const s = Math.max(0, Math.floor(seconds));
+    const m = Math.floor(s / 60);
+    const remainingSec = s % 60;
+    const h = Math.floor(m / 60);
+    const remainingMin = m % 60;
+    if (h > 0) {
+      return `${h}:${remainingMin.toString().padStart(2, "0")}:${remainingSec.toString().padStart(2, "0")}`;
     }
-  }, [subtitleTrackUrl]);
+    return `${remainingMin.toString().padStart(2, "0")}:${remainingSec.toString().padStart(2, "0")}`;
+  };
+
+  const parseTimeStringToSeconds = (input: string): number | null => {
+    const clean = input.trim().replace(/：/g, ":");
+    if (!clean) return null;
+    const parts = clean.split(":").map(Number);
+    if (parts.some(isNaN)) return null;
+    if (parts.length === 3) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    if (parts.length === 2) {
+      return parts[0] * 60 + parts[1];
+    }
+    if (parts.length === 1) {
+      return parts[0] * 60;
+    }
+    return null;
+  };
+
+  // Reset player & subtitle states on movie id change
+  useEffect(() => {
+    setSubtitleTrackUrl(null);
+    setActiveSubTitle(null);
+    setAutoSubLoading(false);
+    autoSubFetchingRef.current = null;
+    setEmbedCurrentTime(0);
+    setEmbedIsPlaying(true);
+    setIsLiveSynced(false);
+    setActiveServerIdx(0);
+  }, [id]);
+
+  // Reset sync status on server change
+  useEffect(() => {
+    setIsLiveSynced(false);
+  }, [activeServerIdx]);
+
+  // Auto-fetch best Persian subtitle when stream opens (always runs if subtitleTrackUrl is null)
+  useEffect(() => {
+    const currentMovie = movie.data;
+    if (!currentMovie || (!activeModal || (activeModal !== "watch" && activeModal !== "stream"))) return;
+    if (subtitleTrackUrl) return;
+
+    const fetchKey = `${currentMovie.id || currentMovie.tmdbId || currentMovie.title}`;
+    if (autoSubFetchingRef.current === fetchKey) return;
+    autoSubFetchingRef.current = fetchKey;
+
+    setAutoSubLoading(true);
+
+    const params = new URLSearchParams({
+      action: "auto",
+      q: currentMovie.title || "",
+    });
+    if (currentMovie.tmdbId) params.set("tmdbId", String(currentMovie.tmdbId));
+    if ((currentMovie as any).imdbId) params.set("imdbId", (currentMovie as any).imdbId);
+    if (currentMovie.year) params.set("year", String(currentMovie.year));
+
+    fetch(`/api/subtitles?${params.toString()}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.ok && data.vtt) {
+          const blob = new Blob([data.vtt], { type: "text/vtt" });
+          const blobUrl = URL.createObjectURL(blob);
+          setSubtitleTrackUrl(blobUrl);
+          const name = data.subtitle?.title || "Persian Subtitle";
+          setActiveSubTitle(name);
+          toast.success("زیرنویس فارسی هماهنگ به صورت خودکار بارگذاری شد ✨", {
+            description: name,
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn("[Movie] Auto subtitle error:", err);
+      })
+      .finally(() => {
+        setAutoSubLoading(false);
+      });
+  }, [activeModal, movie.data?.id, movie.data?.tmdbId, movie.data?.title, subtitleTrackUrl]);
   const modalRef = useRef<HTMLDivElement>(null);
 
   const toggleFullscreen = () => {
@@ -266,6 +369,42 @@ export function MovieView({ id }: { id: string }) {
           reviewSection.scrollIntoView({ behavior: "smooth" });
         }
       }
+
+      // Check for player timeupdate / seek / play / pause events from iframe (VidLink, HTML5 postMessage, etc.)
+      try {
+        let payload = event.data;
+        if (typeof payload === "string") {
+          try {
+            payload = JSON.parse(payload);
+          } catch {}
+        }
+        if (payload && typeof payload === "object") {
+          const eventData = payload.type === "PLAYER_EVENT" && payload.data ? payload.data : payload;
+          const evType = (eventData.event || eventData.type || payload.event || payload.type || "").toString().toLowerCase();
+
+          const tVal =
+            eventData.currentTime ??
+            eventData.time ??
+            eventData.position ??
+            eventData.seconds ??
+            payload.currentTime ??
+            payload.time;
+
+          if (typeof tVal === "number" && !isNaN(tVal) && tVal >= 0) {
+            setEmbedCurrentTime(tVal);
+            setIsLiveSynced(true);
+          }
+
+          if (evType === "pause") {
+            setEmbedIsPlaying(false);
+          } else if (evType === "play" || evType === "playing") {
+            setEmbedIsPlaying(true);
+          } else if (evType === "seeked" && typeof tVal === "number" && !isNaN(tVal) && tVal >= 0) {
+            setEmbedCurrentTime(tVal);
+            setIsLiveSynced(true);
+          }
+        }
+      } catch {}
     };
 
     // 2. Override window.open to catch popup links from embed servers
@@ -462,10 +601,12 @@ export function MovieView({ id }: { id: string }) {
 
   if (m?.tmdbId) {
     allServers.push(
-      { name: "VidZee", url: `https://player.vidzee.wtf/embed/movie/${m.tmdbId}`, sandbox: false },
-      { name: "VidSrc.to", url: `https://vidsrc.to/embed/movie/${m.tmdbId}`, sandbox: false },
-      { name: "2Embed", url: `https://www.2embed.cc/embed/tmdb/movie?id=${m.tmdbId}`, sandbox: false },
-      { name: "VidLink Pro", url: `https://vidlink.pro/movie/${m.tmdbId}`, sandbox: false },
+      { name: "AutoEmbed (کیفیت اصلی Full HD ✨)", url: `https://autoembed.co/movie/tmdb/${m.tmdbId}`, sandbox: false },
+      { name: "2Embed (کیفیت اصلی 1080p BluRay 💎)", url: `https://www.2embed.cc/embed/tmdb/movie?id=${m.tmdbId}`, sandbox: false },
+      { name: "VidSrc.to (سرور پرسرعت و پایدار ⚡)", url: `https://vidsrc.to/embed/movie/${m.tmdbId}`, sandbox: false },
+      { name: "SmashyStream (سرور چند سورس HQ 🎬)", url: `https://embed.smashystream.com/playere.php?tmdb=${m.tmdbId}`, sandbox: false },
+      { name: "VidLink Pro (هماهنگ خودکار با زیرنویس)", url: `https://vidlink.pro/movie/${m.tmdbId}?primaryColor=f59e0b&secondaryColor=18181b&icons=default`, sandbox: false },
+      { name: "VidZee (سرور پشتیبان سراسری 📺)", url: `https://player.vidzee.wtf/embed/movie/${m.tmdbId}`, sandbox: false },
     );
   }
 
@@ -476,30 +617,31 @@ export function MovieView({ id }: { id: string }) {
   const activeServer = allServers[activeServerIdx] || allServers[0];
   const activeServerUrl = activeServer?.url || null;
 
+  const handleSelectBestQuality = () => {
+    // Look for top quality servers in priority: AutoEmbed, 2Embed, VidSrc, SmashyStream
+    const qualityPriority = ["AutoEmbed", "2Embed", "VidSrc", "SmashyStream"];
+    for (const qName of qualityPriority) {
+      const targetIdx = allServers.findIndex((s) => s.name.toLowerCase().includes(qName.toLowerCase()));
+      if (targetIdx !== -1 && targetIdx !== activeServerIdx) {
+        setIframeLoaded(false);
+        setIframeError(false);
+        setActiveServerIdx(targetIdx);
+        toast.success(`سرور با کیفیت برتر 1080p فعال شد ✨`, {
+          description: allServers[targetIdx].name,
+        });
+        return;
+      }
+    }
+    handleNextServer();
+  };
+
   const handleNextServer = useCallback(() => {
     if (allServers.length === 0) return;
     setIframeLoaded(false);
     setIframeError(false);
     setActiveServerIdx((prev) => (prev + 1) % allServers.length);
-    toast.info("در حال تست سرور بعدی...");
+    toast.info("در حال بارگذاری سرور بعدی...");
   }, [allServers.length]);
-
-  // Auto-retry: if iframe doesn't load within 12 seconds, try next server
-  useEffect(() => {
-    if (activeModal !== "stream" || !activeServerUrl || iframeLoaded) return;
-    setIframeError(false);
-    const timer = setTimeout(() => {
-      if (!iframeLoaded && iframeRetryCount.current < allServers.length) {
-        iframeRetryCount.current++;
-        setIframeError(true);
-        toast.error(`سرور ${allServers[activeServerIdx]?.name} پاسخ نداد. در حال تست سرور بعدی...`);
-        handleNextServer();
-      } else if (iframeRetryCount.current >= allServers.length) {
-        setIframeError(true);
-      }
-    }, 12000);
-    return () => clearTimeout(timer);
-  }, [activeModal, activeServerUrl, activeServerIdx, iframeLoaded, allServers.length, handleNextServer]);
 
   // Reset retry counter when modal opens
   useEffect(() => {
@@ -594,14 +736,14 @@ export function MovieView({ id }: { id: string }) {
                 </Button>
               )}
 
-              {activeModal === "stream" && activeServerUrl && typeof document !== "undefined" && (
-                <div className="fixed inset-0 z-[99999]" dir="ltr">
+              {activeModal === "stream" && activeServerUrl && typeof document !== "undefined" && createPortal(
+                <div className="fixed inset-0 z-[999999]" dir="ltr">
                   {/* Backdrop */}
-                  <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setActiveModal(null)} />
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur-md" onClick={() => setActiveModal(null)} />
                   {/* Player container */}
-                  <div ref={modalRef} className={isMaximized ? "fixed inset-0 z-[100000] w-screen h-screen bg-black flex flex-col overflow-hidden" : "absolute inset-4 sm:inset-8 md:inset-12 lg:inset-16 z-[100000] bg-black/95 rounded-2xl overflow-hidden flex flex-col border border-white/10 shadow-2xl"} dir="ltr">
+                  <div ref={modalRef} className={isMaximized ? "fixed inset-0 z-[1000000] w-screen h-screen bg-black flex flex-col overflow-hidden" : "fixed inset-2 sm:inset-4 md:inset-6 z-[1000000] bg-black/95 rounded-2xl overflow-hidden flex flex-col border border-white/20 shadow-2xl"} dir="ltr">
                       {/* Premium Stream Header Bar */}
-                      <div className="flex items-center justify-between px-4 py-3 bg-zinc-950/90 border-b border-white/10 backdrop-blur-md gap-3 shrink-0">
+                      <div className="flex items-center justify-between px-3 sm:px-4 py-2.5 bg-zinc-950/95 border-b border-white/10 backdrop-blur-md gap-2 shrink-0">
                         <div className="flex items-center gap-2 shrink-0">
                           <span className="relative flex h-2.5 w-2.5">
                             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
@@ -610,7 +752,7 @@ export function MovieView({ id }: { id: string }) {
                           <span className="font-bold text-xs sm:text-sm text-white uppercase tracking-wider">Stream Player</span>
                         </div>
 
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex items-center gap-2 shrink-0 flex-wrap">
                           {allServers.length > 1 && (
                             <>
                               {/* Server Selector Dropdown */}
@@ -619,14 +761,14 @@ export function MovieView({ id }: { id: string }) {
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    className="h-8 text-xs bg-zinc-900/90 border-white/20 text-white hover:bg-white/10 gap-1.5 px-3 rounded-lg max-w-[160px] sm:max-w-[240px] justify-between shadow-sm"
+                                    className="h-8 text-xs bg-zinc-900/90 border-white/20 text-white hover:bg-white/10 gap-1.5 px-3 rounded-lg max-w-[170px] sm:max-w-[260px] justify-between shadow-sm"
                                   >
                                     <span className="text-red-400 font-semibold shrink-0">Server:</span>
                                     <span className="truncate">{allServers[activeServerIdx]?.name || "Select"}</span>
                                     <ChevronDown className="size-3.5 text-white/50 shrink-0" />
                                   </Button>
                                 </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="w-56 bg-zinc-900/95 backdrop-blur-xl border-white/15 text-white p-1 shadow-2xl z-[100]">
+                                <DropdownMenuContent align="end" className="w-64 bg-zinc-900/95 backdrop-blur-xl border-white/15 text-white p-1 shadow-2xl z-[100]">
                                   {allServers.map((srv, idx) => (
                                     <DropdownMenuItem
                                       key={idx}
@@ -640,6 +782,17 @@ export function MovieView({ id }: { id: string }) {
                                 </DropdownMenuContent>
                               </DropdownMenu>
 
+                              {/* Best Quality (1080p BluRay) Button */}
+                              <Button
+                                size="sm"
+                                className="h-8 text-xs bg-gradient-to-r from-amber-500 to-yellow-600 hover:from-amber-600 hover:to-yellow-700 text-black font-semibold gap-1 px-2.5 rounded-lg shadow-md shrink-0 border border-yellow-400/40"
+                                onClick={handleSelectBestQuality}
+                                title="انتخاب خودکار سرور با کیفیت برتر (1080p BluRay/Full HD)"
+                              >
+                                <Sparkles className="size-3.5 fill-black text-black" />
+                                <span className="hidden sm:inline">کیفیت برتر (1080p)</span>
+                              </Button>
+
                               {/* AI Smart Server Finder Button */}
                               <Button
                                 size="sm"
@@ -647,7 +800,7 @@ export function MovieView({ id }: { id: string }) {
                                 className="h-8 text-xs bg-purple-950/80 border-purple-500/40 text-purple-200 hover:bg-purple-900/60 gap-1.5 px-2.5 rounded-lg font-medium shadow-md shrink-0"
                                 onClick={runAiServerFinder}
                                 disabled={aiLoading}
-                                title="Run OpenRouter AI Server Health Finder"
+                                title="تست هوشمند پینگ و سلامت سرورها با AI"
                               >
                                 {aiLoading ? (
                                   <Loader2 className="size-3.5 animate-spin text-purple-400" />
@@ -662,7 +815,7 @@ export function MovieView({ id }: { id: string }) {
                                 size="sm"
                                 className="h-8 text-xs bg-red-600 hover:bg-red-700 text-white gap-1 px-2.5 rounded-lg font-medium shadow-md shrink-0"
                                 onClick={handleNextServer}
-                                title="Try Next Server"
+                                title="تغییر به سرور بعدی"
                               >
                                 <Zap className="size-3.5 fill-current text-yellow-300 shrink-0" />
                                 <span className="hidden sm:inline">Next Server</span>
@@ -670,8 +823,17 @@ export function MovieView({ id }: { id: string }) {
                             </>
                           )}
 
-                          {/* Fullscreen Button */}
-                          <SubtitleSelector title={m.title} onSubtitleReady={setSubtitleTrackUrl} />
+                          {/* Subtitle & Fullscreen Buttons */}
+                          <SubtitleSelector
+                            title={m.title}
+                            tmdbId={m.tmdbId}
+                            imdbId={(m as any).imdbId}
+                            year={m.year}
+                            onSubtitleReady={(vttUrl, info) => {
+                              setSubtitleTrackUrl(vttUrl);
+                              if (info?.title) setActiveSubTitle(info.title);
+                            }}
+                          />
                           <Button
                             size="sm"
                             variant="outline"
@@ -681,11 +843,20 @@ export function MovieView({ id }: { id: string }) {
                           >
                             {isMaximized ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
                           </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-8 w-8 p-0 text-white/70 hover:text-white hover:bg-red-600/80 shrink-0 rounded-lg ms-0.5"
+                            onClick={() => setActiveModal(null)}
+                            title="بستن پنجره پخش (Close)"
+                          >
+                            <X className="size-4" />
+                          </Button>
                         </div>
                       </div>
 
-                      {/* Video Container */}
-                      <div className={`w-full bg-black relative ${isMaximized ? "flex-1 min-h-0" : "aspect-video"}`}>
+                      {/* Video Container - Always fills exact available vertical space without clipping */}
+                      <div className="flex-1 min-h-0 w-full bg-black relative flex items-center justify-center overflow-hidden">
                         {aiLoading && (
                           <AiLoadingOverlay recommendation={aiRecommendation} />
                         )}
@@ -702,12 +873,21 @@ export function MovieView({ id }: { id: string }) {
                           onLoad={() => { setIframeLoaded(true); setIframeError(false); }}
                           onError={() => { setIframeError(true); handleNextServer(); }}
                         />
-                        {/* Loading indicator */}
+                        {/* Loading indicator with optional Next Server button */}
                         {!iframeLoaded && !iframeError && (
-                          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/90">
-                            <Loader2 className="size-10 animate-spin text-red-500 mb-4" />
-                            <p className="text-white text-sm font-medium" dir="rtl">در حال بارگذاری سرور {allServers[activeServerIdx]?.name}...</p>
-                            <p className="text-white/50 text-xs mt-2" dir="rtl">اگر بارگذاری نشد، خودکار سرور بعدی تست می‌شود</p>
+                          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/90 p-4 text-center">
+                            <Loader2 className="size-10 animate-spin text-red-500 mb-3" />
+                            <p className="text-white text-sm font-medium" dir="rtl">در حال اتصال به {allServers[activeServerIdx]?.name}...</p>
+                            <p className="text-white/50 text-xs mt-1.5" dir="rtl">اگر تصویر تا چند لحظه دیگر پخش نشد، سرور دیگری را انتخاب کنید</p>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="mt-3 text-xs border-white/20 bg-zinc-900 text-white hover:bg-white/10 gap-1.5"
+                              onClick={handleNextServer}
+                            >
+                              <Zap className="size-3 text-yellow-400" />
+                              تست سرور بعدی
+                            </Button>
                           </div>
                         )}
                         {/* All servers failed */}
@@ -737,54 +917,196 @@ export function MovieView({ id }: { id: string }) {
                             </div>
                           </div>
                         )}
-                        <SubtitleOverlay vttUrl={subtitleTrackUrl} />
+                        <SubtitleOverlay
+                          vttUrl={subtitleTrackUrl}
+                          subtitleLabel={activeSubTitle}
+                          currentTime={embedCurrentTime}
+                          isPlaying={embedIsPlaying}
+                          totalDuration={(m?.runtime || 120) * 60}
+                          isLiveSynced={isLiveSynced}
+                          serverName={activeServer?.name}
+                          onTimeChange={(t) => setEmbedCurrentTime(t)}
+                          onSwitchToLiveServer={() => {
+                            const vidlinkIdx = allServers.findIndex((s) => s.name.includes("VidLink"));
+                            if (vidlinkIdx !== -1) {
+                              setActiveServerIdx(vidlinkIdx);
+                              toast.success("به سرور VidLink Pro (هماهنگ خودکار) منتقل شدید ⚡");
+                            }
+                          }}
+                        />
                       </div>
 
-                      {/* Footer Tip Bar */}
-                      <div className="bg-zinc-950/90 px-4 py-2.5 flex items-center justify-between gap-3 border-t border-white/10" dir="ltr">
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          {aiRecommendation ? (
-                            <>
-                              <Bot className="size-4 text-purple-400 shrink-0" />
-                              <p className="text-xs text-purple-200 font-medium truncate" dir="rtl">
-                                🤖 هوش مصنوعی: {aiRecommendation}
-                              </p>
-                            </>
-                          ) : (
-                            <>
-                              <span className="text-sm shrink-0">💡</span>
-                              <p className="text-xs text-white/70 truncate">
-                                If current mirror is slow or blocked, use <strong className="text-purple-400">AI Finder</strong> or click <strong className="text-red-400 font-semibold">Next Server</strong>.
-                              </p>
-                            </>
-                          )}
+                      {/* Dedicated Cinema Multimedia & Timeline Control Bar */}
+                      <div className="bg-zinc-950/95 border-t border-white/10 px-3 sm:px-4 py-2 flex flex-col gap-1.5 shrink-0 select-none shadow-2xl backdrop-blur-xl" dir="rtl">
+                        {/* Row 1: Play/Pause, Live Time Display, Timeline Scrubber, Sync Badge */}
+                        <div className="flex items-center gap-2.5">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="size-8 p-0 text-white hover:bg-white/10 shrink-0 rounded-full"
+                            onClick={() => setEmbedIsPlaying((p) => !p)}
+                            title={embedIsPlaying ? "توقف زیرنویس و تایمر" : "شروع / ادامه پخش زیرنویس"}
+                          >
+                            {embedIsPlaying ? (
+                              <Pause className="size-4 text-amber-400 fill-amber-400/30" />
+                            ) : (
+                              <Play className="size-4 text-green-400 fill-green-400/30" />
+                            )}
+                          </Button>
+
+                          {/* Time Badge (دقیقه چنده) */}
+                          <div className="flex items-center gap-1.5 shrink-0 font-mono text-xs text-white" dir="ltr">
+                            <span className="font-bold text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
+                              {formatPlayerTime(embedCurrentTime)}
+                            </span>
+                            <span className="text-white/40">/</span>
+                            <span className="text-white/60">{formatPlayerTime((m?.runtime || 120) * 60)}</span>
+                            <span className="text-[11px] text-amber-200/80 ms-1 hidden sm:inline" dir="rtl">
+                              (دقیقه {Math.floor(embedCurrentTime / 60)})
+                            </span>
+                          </div>
+
+                          {/* Interactive Timeline Scrubber */}
+                          <div className="flex-1 min-w-0 flex items-center relative" dir="ltr">
+                            <input
+                              type="range"
+                              min={0}
+                              max={(m?.runtime || 120) * 60}
+                              step={1}
+                              value={embedCurrentTime}
+                              onChange={(e) => {
+                                setEmbedCurrentTime(Number(e.target.value));
+                              }}
+                              className="w-full accent-amber-500 cursor-pointer h-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-all"
+                              title="جابجایی در طول فیلم و هماهنگی زیرنویس"
+                            />
+                          </div>
+
+                          {/* Live Sync Status indicator */}
+                          <div className="shrink-0 flex items-center gap-1 text-[11px]">
+                            {isLiveSynced ? (
+                              <span className="flex items-center gap-1 text-emerald-400 font-medium bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                                <span className="size-2 rounded-full bg-emerald-400 animate-pulse" />
+                                <span className="hidden md:inline">همگام خودکار با پلیر ⚡</span>
+                              </span>
+                            ) : (
+                              <span className="flex items-center gap-1 text-zinc-300 bg-zinc-900 px-2 py-0.5 rounded-full border border-zinc-800">
+                                <Clock className="size-3 text-amber-400" />
+                                <span className="hidden md:inline">کنترل دستی زیرنویس</span>
+                              </span>
+                            )}
+                          </div>
                         </div>
-                        <Badge variant="outline" className="text-[10px] text-white/60 border-white/15 shrink-0 hidden md:inline-flex">
-                          HD 1080p
-                        </Badge>
+
+                        {/* Row 2: Quick Jump Buttons (-1m, -10s, +10s, +1m) + Jump to Minute Form + Subtitle Title */}
+                        <div className="flex items-center justify-between gap-2 text-xs flex-wrap">
+                          {/* Quick Seek Buttons */}
+                          <div className="flex items-center gap-1" dir="ltr">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px] bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded"
+                              onClick={() => setEmbedCurrentTime((t) => Math.max(0, t - 60))}
+                              title="۱ دقیقه به عقب"
+                            >
+                              -1m
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px] bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded"
+                              onClick={() => setEmbedCurrentTime((t) => Math.max(0, t - 10))}
+                              title="۱۰ ثانیه به عقب"
+                            >
+                              -10s
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px] bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded"
+                              onClick={() => setEmbedCurrentTime((t) => Math.min((m?.runtime || 120) * 60, t + 10))}
+                              title="۱۰ ثانیه به جلو"
+                            >
+                              +10s
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px] bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded"
+                              onClick={() => setEmbedCurrentTime((t) => Math.min((m?.runtime || 120) * 60, t + 60))}
+                              title="۱ دقیقه به جلو"
+                            >
+                              +1m
+                            </Button>
+                          </div>
+
+                          {/* Jump to exact minute input */}
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              const sec = parseTimeStringToSeconds(jumpMinuteInput);
+                              if (sec !== null && sec >= 0) {
+                                setEmbedCurrentTime(sec);
+                                setJumpMinuteInput("");
+                                toast.success(`پرش به زمان ${formatPlayerTime(sec)}`);
+                              } else {
+                                toast.error("زمان وارد شده نامعتبر است (مثال: 41 یا 1:34:09)");
+                              }
+                            }}
+                            className="flex items-center gap-1.5"
+                          >
+                            <span className="text-zinc-400 text-[11px] hidden sm:inline">پرش مستقیم:</span>
+                            <Input
+                              value={jumpMinuteInput}
+                              onChange={(e) => setJumpMinuteInput(e.target.value)}
+                              placeholder="دقیقه (مثلاً 41 یا 1:34:09)"
+                              className="h-6 w-28 text-center font-mono text-[11px] bg-zinc-900 border-zinc-700 text-white p-0 rounded"
+                            />
+                            <Button
+                              type="submit"
+                              size="sm"
+                              className="h-6 px-2.5 text-[11px] bg-amber-500 hover:bg-amber-600 text-black font-semibold rounded"
+                            >
+                              برو
+                            </Button>
+                          </form>
+
+                          {/* Active Subtitle Name */}
+                          <div className="flex items-center gap-2 text-zinc-400 text-[11px] truncate max-w-sm">
+                            {activeSubTitle ? (
+                              <span className="truncate text-zinc-300">
+                                زیرنویس: <strong className="text-amber-300 font-normal">{activeSubTitle}</strong>
+                              </span>
+                            ) : (
+                              <span className="text-zinc-500">زیرنویس خودکار فعال است</span>
+                            )}
+                          </div>
+                        </div>
                       </div>
                       </div>
-                      </div>
+                      </div>,
+                      document.body
                       )}
 
-                  {activeModal === "trailer" && trailerKey && typeof document !== "undefined" && (
-                  <div className="fixed inset-0 z-[99999]" dir="ltr">
-                  <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setActiveModal(null)} />
-                  <div className="absolute inset-4 sm:inset-8 md:inset-12 lg:inset-16 z-[100000] bg-black/95 rounded-2xl overflow-hidden border border-white/10 shadow-2xl">
-                  <div className="flex items-center justify-between px-4 py-2 bg-zinc-950/90 border-b border-white/10">
-                    <span className="text-xs text-white/70">Trailer</span>
+                  {activeModal === "trailer" && trailerKey && typeof document !== "undefined" && createPortal(
+                  <div className="fixed inset-0 z-[999999]" dir="ltr">
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur-md" onClick={() => setActiveModal(null)} />
+                  <div className="fixed inset-4 sm:inset-8 md:inset-12 lg:inset-16 z-[1000000] bg-black/95 rounded-2xl overflow-hidden border border-white/20 shadow-2xl flex flex-col">
+                  <div className="flex items-center justify-between px-4 py-2.5 bg-zinc-950/90 border-b border-white/10 shrink-0">
+                    <span className="text-xs text-white/70 font-semibold">Trailer</span>
                     <button className="text-white/70 hover:text-white text-lg px-2" onClick={() => setActiveModal(null)}>✕</button>
                   </div>
-                  <div className="aspect-video">
+                  <div className="flex-1 min-h-0 relative">
                     <iframe
                       src={`https://www.youtube.com/embed/${trailerKey}`}
-                      className="size-full"
+                      className="size-full border-0 absolute inset-0"
                       allowFullScreen
                       allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                     />
                   </div>
                   </div>
-                  </div>
+                  </div>,
+                  document.body
                   )}
 
               {user ? (

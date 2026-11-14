@@ -331,6 +331,13 @@ io.on("connection", (socket: Socket) => {
     systemMessage(data.roomId, `Movie changed to "${data.movie?.title || "New Movie"}"`);
   });
 
+  socket.on("room:subtitle", (data: { roomId: string; vttText?: string; title?: string }) => {
+    socket.to(data.roomId).emit("room:subtitle", data);
+    if (data.title) {
+      systemMessage(data.roomId, `زیرنویس فارسی "${data.title}" هماهنگ شد`);
+    }
+  });
+
   const handleDisconnect = () => {
     for (const roomId of socketRooms) {
       const room = rooms.get(roomId);

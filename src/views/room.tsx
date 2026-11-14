@@ -142,14 +142,70 @@ export function RoomView({ id }: { id: string }) {
   const [localFileName, setLocalFileName] = useState<string | null>(null);
   const [localFileFingerprint, setLocalFileFingerprint] = useState<string | null>(null);
   const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
+  const [activeSubTitle, setActiveSubTitle] = useState<string | null>(null);
+  const autoSubFetchedRef = useRef<string | null>(null);
   const [expectedFileName, setExpectedFileName] = useState<string | null>(null);
   const [expectedFingerprint, setExpectedFingerprint] = useState<string | null>(null);
   const [fingerprintMismatch, setFingerprintMismatch] = useState(false);
   const [subtitleSearchOpen, setSubtitleSearchOpen] = useState(false);
-  const handleSubtitleReady = (url: string) => {
+  const handleSubtitleReady = (url: string, vttRawText?: string, titleName?: string) => {
     if (subtitleUrl) URL.revokeObjectURL(subtitleUrl);
     setSubtitleUrl(url);
+    if (titleName) setActiveSubTitle(titleName);
+    if (isHost && socket) {
+      if (vttRawText) {
+        socket.emit("room:subtitle", { roomId: id, vttText: vttRawText, title: titleName || activeSubTitle });
+      } else {
+        fetch(url).then(r => r.text()).then(txt => {
+          socket.emit("room:subtitle", { roomId: id, vttText: txt, title: titleName || activeSubTitle });
+        }).catch(() => {});
+      }
+    }
   };
+
+  // Auto-fetch best Persian subtitle for room movie
+  useEffect(() => {
+    const movieObj = room.data?.movie;
+    if (!movieObj || subtitleUrl) return;
+
+    const movieKey = `${movieObj.id || movieObj.title}_${movieObj.tmdbId || ""}`;
+    if (autoSubFetchedRef.current === movieKey) return;
+
+    autoSubFetchedRef.current = movieKey;
+    let isCancelled = false;
+
+    const params = new URLSearchParams({
+      action: "auto",
+      q: movieObj.title || "",
+    });
+    if (movieObj.tmdbId) params.set("tmdbId", String(movieObj.tmdbId));
+    if ((movieObj as any).imdbId) params.set("imdbId", (movieObj as any).imdbId);
+    if (movieObj.year) params.set("year", String(movieObj.year));
+
+    fetch(`/api/subtitles?${params.toString()}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (isCancelled) return;
+        if (data.ok && data.vtt) {
+          const blob = new Blob([data.vtt], { type: "text/vtt" });
+          const blobUrl = URL.createObjectURL(blob);
+          if (subtitleUrl) URL.revokeObjectURL(subtitleUrl);
+          setSubtitleUrl(blobUrl);
+          const name = data.subtitle?.title || "Persian Subtitle";
+          setActiveSubTitle(name);
+          toast.success("زیرنویس فارسی واچ‌پارتی به صورت خودکار فعال شد ✨", {
+            description: name,
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn("[Room] Auto subtitle fetch error:", err);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [room.data?.movie, subtitleUrl]);
   const [subtitlesSearching, setSubtitlesSearching] = useState(false);
   const [subtitleResults, setSubtitleResults] = useState<any[]>([]);
   const [subtitleSource, setSubtitleSource] = useState<'opensubtitles' | 'subscene'>('subscene');
@@ -654,6 +710,16 @@ export function RoomView({ id }: { id: string }) {
       sock.on("room:movie-changed", () => {
         qc.invalidateQueries({ queryKey: ["room", id] });
       });
+      sock.on("room:subtitle", (data: { vttText?: string; title?: string }) => {
+        if (data.vttText) {
+          const blob = new Blob([data.vttText], { type: "text/vtt" });
+          const blobUrl = URL.createObjectURL(blob);
+          if (subtitleUrl) URL.revokeObjectURL(subtitleUrl);
+          setSubtitleUrl(blobUrl);
+          if (data.title) setActiveSubTitle(data.title);
+          toast.info(`زیرنویس فارسی "${data.title || "جدید"}" توسط میزبان همگام شد`);
+        }
+      });
       sock.on("room:full", () => {
         toast.error(t("rooms.roomFull"));
         navigate("/rooms");
@@ -893,12 +959,12 @@ export function RoomView({ id }: { id: string }) {
   const defaultSandbox = "allow-same-origin allow-scripts allow-presentation allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-top-navigation-by-user-activation allow-downloads";
 
   const roomTmdbServers: ServerConfig[] = r?.movie?.tmdbId ? [
-    { name: "VidSrc ME", url: `https://vidsrcme.ru/embed/movie?tmdb=${r.movie.tmdbId}`, sandbox: false },
-    { name: "VidSrc NL", url: `https://player.vidsrc.nl/movie/${r.movie.tmdbId}`, sandbox: false },
-    { name: "AnyEmbed", url: `https://anyembed.xyz/embed/tmdb-movie-${r.movie.tmdbId}`, sandbox: false },
-    { name: "AutoEmbed", url: `https://autoembed.co/movie/tmdb/${r.movie.tmdbId}`, sandbox: false },
-    { name: "SmashyStream", url: `https://embed.smashystream.com/playere.php?tmdb=${r.movie.tmdbId}`, sandbox: false },
-    { name: "VidLink Pro", url: `https://vidlink.pro/movie/${r.movie.tmdbId}`, sandbox: false },
+    { name: "2Embed (کیفیت اصلی 1080p BluRay 💎)", url: `https://www.2embed.cc/embed/tmdb/movie?id=${r.movie.tmdbId}`, sandbox: false },
+    { name: "AutoEmbed (کیفیت Full HD ✨)", url: `https://autoembed.co/movie/tmdb/${r.movie.tmdbId}`, sandbox: false },
+    { name: "SmashyStream (سرور چند سورس HQ 🎬)", url: `https://embed.smashystream.com/playere.php?tmdb=${r.movie.tmdbId}`, sandbox: false },
+    { name: "VidSrc.to (سرور پرسرعت ⚡)", url: `https://vidsrc.to/embed/movie/${r.movie.tmdbId}`, sandbox: false },
+    { name: "VidZee (سرور پشتیبان 📺)", url: `https://player.vidzee.wtf/embed/movie/${r.movie.tmdbId}`, sandbox: false },
+    { name: "VidLink Pro (هماهنگ با زیرنویس)", url: `https://vidlink.pro/movie/${r.movie.tmdbId}?primaryColor=f59e0b&secondaryColor=18181b&icons=default`, sandbox: false },
   ] : [];
 
   // Use local file if available, otherwise use active mirror or room movie URL
@@ -1293,7 +1359,15 @@ export function RoomView({ id }: { id: string }) {
                     allowFullScreen={true}
                     allow="autoplay *; fullscreen *; encrypted-media *; picture-in-picture *; accelerometer *; gyroscope *"
                   />
-                  <SubtitleOverlay vttUrl={subtitleUrl} />
+                  <SubtitleOverlay
+                    vttUrl={subtitleUrl}
+                    currentTime={playback.currentTime}
+                    isPlaying={playback.isPlaying}
+                    subtitleLabel={activeSubTitle}
+                    totalDuration={7200}
+                    isLiveSynced={true}
+                    serverName={activeRoomServer?.name}
+                  />
                   {!isHost && (
                     <div className="absolute top-2 start-2 bg-black/75 backdrop-blur px-2.5 py-1 rounded-full text-xs text-white border border-white/10 shadow-lg pointer-events-none">
                       {t("rooms.syncedPlayback")}
@@ -1455,7 +1529,16 @@ export function RoomView({ id }: { id: string }) {
                   className="hidden"
                 />
               </label>
-              <SubtitleSelector title={room.data?.movie?.title || ""} onSubtitleReady={handleSubtitleReady} />
+              <SubtitleSelector
+                title={room.data?.movie?.title || ""}
+                tmdbId={room.data?.movie?.tmdbId}
+                imdbId={(room.data?.movie as any)?.imdbId}
+                year={room.data?.movie?.year}
+                onSubtitleReady={(url, info) => {
+                  handleSubtitleReady(url, undefined, info?.title);
+                  if (info?.title) setActiveSubTitle(info.title);
+                }}
+              />
             </div>
             {localFileName && !fingerprintMismatch && (
               <p className="text-xs text-green-500 mt-2 flex items-center gap-1">

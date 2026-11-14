@@ -7,11 +7,14 @@ interface ServerCheckResult {
   status: "online" | "slow" | "offline";
   latencyMs: number;
   verifiedPlayable: boolean;
+  isCam?: boolean;
+  quality?: "1080p BluRay" | "Full HD" | "HD" | "CAM/TS";
+  qualityScore?: number;
   notes?: string;
 }
 
 // Deep server-side content verification helper
-async function checkServerHealth(name: string, url: string, timeoutMs = 2000): Promise<ServerCheckResult> {
+async function checkServerHealth(name: string, url: string, timeoutMs = 2500): Promise<ServerCheckResult> {
   const start = Date.now();
   try {
     const controller = new AbortController();
@@ -40,25 +43,60 @@ async function checkServerHealth(name: string, url: string, timeoutMs = 2000): P
     const lowerHtml = htmlText.toLowerCase();
 
     // Check for common error signatures inside embed response HTML
-    const errorKeywords = ["not found", "video not found", "404 error", "file deleted", "no player", "content unavailable", "disabled", "no stream"];
+    const errorKeywords = [
+      "not found",
+      "video not found",
+      "404 error",
+      "file deleted",
+      "no player",
+      "content unavailable",
+      "disabled",
+      "no stream",
+      "couldn't find this content",
+      "could not find",
+    ];
     const hasError = errorKeywords.some((kw) => lowerHtml.includes(kw));
 
     if (hasError) {
-      return { name, url, status: "offline", latencyMs: latency, verifiedPlayable: false, notes: "Error page detected" };
+      return { name, url, status: "offline", latencyMs: latency, verifiedPlayable: false, notes: "Error or missing content" };
     }
+
+    // Detect CAM / Telesync keywords vs High Definition
+    const camKeywords = ["telesync", "camrip", "hdcam", "hdts", "predvd", "ts rip", "cam rip", "hd-ts", "cam-rip", "hdtc"];
+    const isCam = camKeywords.some((kw) => lowerHtml.includes(kw));
+
+    const hdKeywords = ["1080p", "bluray", "web-dl", "webdl", "brrip", "bdrip", "hdrip", "master", "full hd"];
+    const isHd = hdKeywords.some((kw) => lowerHtml.includes(kw));
 
     // Check for positive player signatures
     const playerKeywords = ["iframe", "player", "video", "m3u8", "source", "vidsrc", "stream", "hls", "jwplayer", "embed", "play"];
     const hasPlayer = playerKeywords.some((kw) => lowerHtml.includes(kw));
 
     if (hasPlayer) {
+      let qualityScore = 70;
+      let quality: "1080p BluRay" | "Full HD" | "HD" | "CAM/TS" = "HD";
+
+      if (isCam) {
+        qualityScore = 30;
+        quality = "CAM/TS";
+      } else if (name.includes("2Embed") || name.includes("AutoEmbed") || isHd) {
+        qualityScore = 100;
+        quality = "1080p BluRay";
+      } else if (name.includes("SmashyStream") || name.includes("VidSrc")) {
+        qualityScore = 90;
+        quality = "Full HD";
+      }
+
       return {
         name,
         url,
         status: latency < 1500 ? "online" : "slow",
         latencyMs: latency,
         verifiedPlayable: true,
-        notes: "Player HTML verified",
+        isCam,
+        quality,
+        qualityScore,
+        notes: isCam ? "کیفیت پرده‌ای (CAM)" : "کیفیت اصلی (1080p BluRay/HD)",
       };
     }
 
@@ -87,15 +125,18 @@ export async function GET(req: NextRequest) {
   }
 
   const candidateServers = type === "tv" ? [
-    { name: "VidSrc ME", url: `https://vidsrcme.ru/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}` },
+    { name: "2Embed", url: `https://www.2embed.cc/embed/tmdb/tv?id=${tmdbId}&s=${season}&e=${episode}` },
     { name: "AutoEmbed", url: `https://autoembed.co/tv/tmdb/${tmdbId}-${season}-${episode}` },
+    { name: "SmashyStream", url: `https://embed.smashystream.com/playere.php?tmdb=${tmdbId}&season=${season}&episode=${episode}` },
+    { name: "VidSrc.to", url: `https://vidsrc.to/embed/tv/${tmdbId}/${season}/${episode}` },
+    { name: "VidZee", url: `https://player.vidzee.wtf/embed/tv/${tmdbId}/${season}/${episode}` },
     { name: "VidLink Pro", url: `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}` },
   ] : [
-    { name: "VidSrc ME", url: `https://vidsrcme.ru/embed/movie?tmdb=${tmdbId}` },
-    { name: "VidSrc NL", url: `https://player.vidsrc.nl/movie/${tmdbId}` },
-    { name: "AnyEmbed", url: `https://anyembed.xyz/embed/tmdb-movie-${tmdbId}` },
+    { name: "2Embed", url: `https://www.2embed.cc/embed/tmdb/movie?id=${tmdbId}` },
     { name: "AutoEmbed", url: `https://autoembed.co/movie/tmdb/${tmdbId}` },
     { name: "SmashyStream", url: `https://embed.smashystream.com/playere.php?tmdb=${tmdbId}` },
+    { name: "VidSrc.to", url: `https://vidsrc.to/embed/movie/${tmdbId}` },
+    { name: "VidZee", url: `https://player.vidzee.wtf/embed/movie/${tmdbId}` },
     { name: "VidLink Pro", url: `https://vidlink.pro/movie/${tmdbId}` },
   ];
 
@@ -107,15 +148,20 @@ export async function GET(req: NextRequest) {
   // Filter only genuinely verified playable servers
   const verifiedServers = healthResults.filter((s) => s.verifiedPlayable && s.status !== "offline");
 
-  // Sort verified servers by latency ascending (fastest first)
-  verifiedServers.sort((a, b) => a.latencyMs - b.latencyMs);
+  // Sort verified servers: qualityScore descending (1080p BluRay first, avoid CAM), then latency ascending
+  verifiedServers.sort((a, b) => {
+    const scoreDiff = (b.qualityScore || 50) - (a.qualityScore || 50);
+    if (scoreDiff !== 0) return scoreDiff;
+    return a.latencyMs - b.latencyMs;
+  });
 
-  const settings = getSystemSettings();
-  let aiRecommendation = verifiedServers.length > 0
-    ? `بهترین سرور فعال: ${verifiedServers[0].name} با سرعت ${verifiedServers[0].latencyMs}ms`
-    : "سرورهای با بالاترین پایداری شناسایی شدند.";
-  let recommendedIndex = 0;
+  const bestHd = verifiedServers[0];
+  let aiRecommendation = bestHd
+    ? `سرور با بالاترین کیفیت: ${bestHd.name} (${bestHd.quality || "1080p BluRay"}) با پینگ ${bestHd.latencyMs}ms`
+    : "سرورهای با بالاترین کیفیت و پایداری شناسایی شدند.";
+  let recommendedIndex = bestHd ? candidateServers.findIndex((s) => s.name === bestHd.name) : 0;
 
+  const settings = await getSystemSettings();
   const openRouterApiKey = settings.openRouterApiKey;
   const modelName = settings.openRouterModel;
 

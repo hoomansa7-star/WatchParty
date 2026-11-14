@@ -11,8 +11,11 @@ export const registerSchema = z.object({
 });
 
 export const loginSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(1),
+  email: z.string().optional(),
+  username: z.string().optional(),
+  name: z.string().optional(),
+  identifier: z.string().optional(),
+  password: z.string().optional(),
 });
 
 export const reviewSchema = z.object({
